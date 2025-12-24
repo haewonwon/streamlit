@@ -135,8 +135,11 @@ def load_environment_data(data_dir: str) -> pd.DataFrame:
 
     # (이하 데이터 전처리 로직은 기존과 동일)
     if "time" in env.columns:
+        # 원본 문자열 보존
+        env["time_raw"] = env["time"].astype(str)
         env["time"] = pd.to_datetime(env["time"], errors="coerce")
     else:
+        env["time_raw"] = ""
         env["time"] = pd.NaT
 
     for c in ["temperature", "humidity", "ph", "ec"]:
@@ -257,6 +260,81 @@ def make_ec_target_table() -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _try_parse_time_series(s: pd.Series) -> Tuple[pd.Series, str]:
+    """여러 전략으로 time 문자열 시리즈를 파싱해 시도합니다.
+
+    반환값: (parsed_series, note)
+    - parsed_series: datetime64[ns] 시리즈(성공하면 일부/전체 값이 채워짐)
+    - note: 어떤 전략으로 성공했는지 또는 'failed'
+    """
+    import re
+
+    # 이미 datetime이면 그대로 반환
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s, "already_datetime"
+
+    s_str = s.astype(str).fillna("").str.strip()
+
+    # 기본 전처리: 괄호/타임존 토큰 제거
+    s_clean = s_str.str.replace(r"\(.*?\)", "", regex=True)
+    s_clean = s_clean.str.replace(r"\b(KST|UTC|GMT|한국 표준시)\b", "", regex=True).str.strip()
+
+    # 1) 기본 infer 시도
+    parsed = pd.to_datetime(s_clean, errors="coerce", infer_datetime_format=True, dayfirst=False)
+    if not parsed.isna().all():
+        return parsed, "parsed_infer"
+
+    # 2) dayfirst True 시도
+    parsed = pd.to_datetime(s_clean, errors="coerce", infer_datetime_format=True, dayfirst=True)
+    if not parsed.isna().all():
+        return parsed, "parsed_dayfirst"
+
+    # 3) 포맷 목록으로 시도
+    formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y.%m.%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M",
+        "%Y%m%d%H%M%S",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%Y.%m.%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%Y%m%d",
+    ]
+    for fmt in formats:
+        parsed = pd.to_datetime(s_clean, format=fmt, errors="coerce")
+        if not parsed.isna().all():
+            return parsed, f"parsed_format_{fmt}"
+
+    # 4) 숫자(유닉스 타임스탬프) 시도
+    digits = s_clean.str.match(r"^\d{9,}$")
+    if digits.any():
+        try:
+            vals = s_clean[digits].astype("int64")
+            parsed_try = pd.to_datetime(vals, unit="s", errors="coerce")
+            full = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+            full[digits] = parsed_try
+            if not full.isna().all():
+                return full, "parsed_unix_s"
+        except Exception:
+            pass
+        try:
+            vals = s_clean[digits].astype("int64")
+            parsed_try = pd.to_datetime(vals, unit="ms", errors="coerce")
+            full = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+            full[digits] = parsed_try
+            if not full.isna().all():
+                return full, "parsed_unix_ms"
+        except Exception:
+            pass
+
+    return pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]"), "failed"
 
 
 # =========================
@@ -456,9 +534,41 @@ with tab2:
     if env_sel.empty:
         st.error("선택한 조건에 해당하는 환경 데이터가 없습니다.")
     else:
-        # time이 NaT인 경우 대비
+        # time이 NaT인 경우를 대비해 자동 파싱을 시도하고, 실패하면 인덱스 기반 대체 시각화를 표시
         if env_sel["time"].isna().all():
-            st.error("time 컬럼을 날짜/시간으로 변환하지 못했습니다. CSV의 time 형식을 확인해주세요.")
+            # env_sel에는 'time_raw'가 보존되어 있음
+            parsed, note = _try_parse_time_series(env_sel.get("time_raw", env_sel["time"]))
+            if not parsed.isna().all():
+                st.warning(f"time 컬럼을 자동으로 파싱했습니다 ({note}). 그래프를 표시합니다. 원본 CSV를 확인하세요.")
+                env_ts = env_sel.copy()
+                env_ts["time"] = parsed
+            else:
+                st.warning(
+                    "time 컬럼을 날짜/시간으로 변환하지 못했습니다. CSV의 time 형식을 확인해주세요. 행 인덱스를 x축으로 하는 대체 시각화를 표시합니다."
+                )
+                env_idx = env_sel.reset_index(drop=True).copy()
+                env_idx["__row"] = pd.RangeIndex(start=0, stop=len(env_idx))
+
+                # 온도
+                fig_t = px.line(env_idx, x="__row", y="temperature", title="온도 변화 (행 인덱스 기반)")
+                fig_t = apply_plotly_korean_font(fig_t)
+                st.plotly_chart(fig_t, use_container_width=True)
+
+                # 습도
+                fig_h = px.line(env_idx, x="__row", y="humidity", title="습도 변화 (행 인덱스 기반)")
+                fig_h = apply_plotly_korean_font(fig_h)
+                st.plotly_chart(fig_h, use_container_width=True)
+
+                # EC
+                fig_ec = px.line(env_idx, x="__row", y="ec", title="EC 변화 (행 인덱스 기반)")
+                fig_ec = apply_plotly_korean_font(fig_ec)
+                st.plotly_chart(fig_ec, use_container_width=True)
+
+                # 원본 time_raw를 하단에 보여줌
+                with st.expander("원본 time 값(자동 파싱 실패)"):
+                    st.write(env_idx["time_raw"].head(50))
+                # 이후 처리는 건너뜀
+                env_ts = None
         else:
             env_ts = env_sel.dropna(subset=["time"]).copy()
 
