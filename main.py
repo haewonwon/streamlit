@@ -222,6 +222,16 @@ def apply_plotly_korean_font(fig: go.Figure) -> go.Figure:
     return fig
 
 
+def _statsmodels_available() -> bool:
+    """statsmodels 가 설치되어 있는지 안전하게 검사합니다."""
+    try:
+        import statsmodels  # type: ignore
+
+        return True
+    except Exception:
+        return False
+
+
 def safe_mean(series: pd.Series) -> Optional[float]:
     s = pd.to_numeric(series, errors="coerce")
     if s.dropna().empty:
@@ -617,16 +627,26 @@ with tab3:
     else:
         c1, c2 = st.columns(2)
 
+        # trendline(OLS)은 statsmodels에 의존하므로 설치 여부를 확인해서 안전하게 사용합니다.
+        sm_ok = _statsmodels_available()
+        want_trend_sc1 = len(growth_sel.dropna(subset=["잎 수(장)", "생중량(g)"])) >= 5
+        if want_trend_sc1 and not sm_ok:
+            st.warning("statsmodels가 설치되어 있지 않아 산점도에 추세선(OLS)을 표시할 수 없습니다. 'statsmodels'를 requirements.txt에 추가하고 재배포하세요.")
+
         fig_sc1 = px.scatter(
             growth_sel,
             x="잎 수(장)",
             y="생중량(g)",
             color="school" if selected_school == "전체" else None,
             title="잎 수 vs 생중량",
-            trendline="ols" if len(growth_sel.dropna(subset=["잎 수(장)", "생중량(g)"])) >= 5 else None,
+            trendline="ols" if (sm_ok and want_trend_sc1) else None,
         )
         fig_sc1 = apply_plotly_korean_font(fig_sc1)
         c1.plotly_chart(fig_sc1, use_container_width=True)
+
+        want_trend_sc2 = len(growth_sel.dropna(subset=["지상부 길이(mm)", "생중량(g)"])) >= 5
+        if want_trend_sc2 and not sm_ok:
+            st.warning("statsmodels가 설치되어 있지 않아 산점도에 추세선(OLS)을 표시할 수 없습니다. 'statsmodels'를 requirements.txt에 추가하고 재배포하세요.")
 
         fig_sc2 = px.scatter(
             growth_sel,
@@ -634,7 +654,7 @@ with tab3:
             y="생중량(g)",
             color="school" if selected_school == "전체" else None,
             title="지상부 길이 vs 생중량",
-            trendline="ols" if len(growth_sel.dropna(subset=["지상부 길이(mm)", "생중량(g)"])) >= 5 else None,
+            trendline="ols" if (sm_ok and want_trend_sc2) else None,
         )
         fig_sc2 = apply_plotly_korean_font(fig_sc2)
         c2.plotly_chart(fig_sc2, use_container_width=True)
