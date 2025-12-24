@@ -55,7 +55,7 @@ COLOR_BY_SCHOOL = {
 
 
 # =========================
-# 유니코드 정규화 유틸
+# 유니코드 정규화 유틸 (수정됨)
 # =========================
 def _norm_variants(text: str) -> Tuple[str, str]:
     """NFC/NFD 두 형태를 모두 반환."""
@@ -65,59 +65,43 @@ def _norm_variants(text: str) -> Tuple[str, str]:
     )
 
 
-def _contains_school_token(filename: str, school: str) -> bool:
-    """파일명에 학교 토큰이 포함되는지 NFC/NFD 양방향으로 비교."""
-    fn_nfc, fn_nfd = _norm_variants(filename)
-    sc_nfc, sc_nfd = _norm_variants(school)
-    return (sc_nfc in fn_nfc) or (sc_nfd in fn_nfd) or (sc_nfc in fn_nfd) or (sc_nfd in fn_nfc)
+def _contains_token(text: str, token: str) -> bool:
+    """텍스트에 토큰이 포함되는지(한글 자소 분리 무시) 확인"""
+    text_nfc, text_nfd = _norm_variants(text)
+    token_nfc, token_nfd = _norm_variants(token)
+    return (token_nfc in text_nfc) or (token_nfd in text_nfd) or (token_nfc in text_nfd) or (token_nfd in text_nfc)
 
 
-def _find_data_files(data_dir: Path) -> Tuple[Dict[str, Path], Optional[Path]]:
+def _find_data_files(data_dir: Path) -> Tuple[Dict[str, Path], List[Path]]:
     """
-    ✅ pathlib.Path.iterdir() 기반
-    ✅ NFC/NFD 양방향 비교로 학교별 CSV + xlsx 탐색
-    ❌ glob 패턴만 사용 금지
-    ❌ f-string 파일명 조합 금지
+    CSV 환경 데이터와 (XLSX 또는 CSV) 생육 데이터를 모두 찾습니다.
     """
     env_csv_by_school: Dict[str, Path] = {}
-    xlsx_path: Optional[Path] = None
+    growth_files: List[Path] = []  # xlsx 하나거나, csv 여러개
 
-    if not data_dir.exists() or not data_dir.is_dir():
-        return env_csv_by_school, xlsx_path
+    if not data_dir.exists():
+        return env_csv_by_school, growth_files
 
     for p in data_dir.iterdir():
         if not p.is_file():
             continue
 
         name = p.name
-        suffix_lower = p.suffix.lower()
 
-        # 환경 CSV 찾기
-        if suffix_lower == ".csv":
-            # '환경데이터' 토큰도 NFC/NFD로 비교
-            token_nfc, token_nfd = _norm_variants("환경데이터")
-            name_nfc, name_nfd = _norm_variants(name)
-            has_env_token = (token_nfc in name_nfc) or (token_nfd in name_nfd) or (token_nfc in name_nfd) or (token_nfd in name_nfc)
+        # 1. 환경 데이터 (CSV) 찾기 ("환경" + 학교명)
+        if _contains_token(name, "환경"):
+            for sc in SCHOOLS:
+                if _contains_token(name, sc):
+                    env_csv_by_school[sc] = p
+                    break
 
-            if has_env_token:
-                for sc in SCHOOLS:
-                    if _contains_school_token(name, sc):
-                        env_csv_by_school[sc] = p
-                        break
+        # 2. 생육 데이터 (XLSX 또는 CSV) 찾기 ("생육" 또는 "결과")
+        # 엑셀 파일이든, 분리된 CSV 파일이든 '생육'이라는 글자가 있으면 후보로 등록
+        if _contains_token(name, "생육") or _contains_token(name, "결과"):
+            if name.lower().endswith((".xlsx", ".csv")):
+                growth_files.append(p)
 
-        # 생육결과 xlsx 찾기
-        if suffix_lower == ".xlsx":
-            # '생육결과' 토큰을 우선으로 찾아보고, 없으면 첫 xlsx라도 사용
-            token_nfc, token_nfd = _norm_variants("생육결과")
-            name_nfc, name_nfd = _norm_variants(name)
-            has_growth_token = (token_nfc in name_nfc) or (token_nfd in name_nfd) or (token_nfc in name_nfd) or (token_nfd in name_nfc)
-
-            if has_growth_token:
-                xlsx_path = p
-            elif xlsx_path is None:
-                xlsx_path = p
-
-    return env_csv_by_school, xlsx_path
+    return env_csv_by_school, growth_files
 
 
 # =========================
@@ -138,12 +122,10 @@ def load_environment_data(data_dir: str) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
     for sc, fp in env_csv_by_school.items():
         try:
-            df = pd.read_csv(fp)
-            df = df.copy()
+            df = pd.read_csv(fp)  # encoding="utf-8-sig" or "cp949" may be needed sometimes
             df["school"] = sc
             frames.append(df)
         except Exception:
-            # 캐시 함수 내부에서는 상세 메시지 대신 빈 프레임으로 처리
             continue
 
     if not frames:
@@ -151,23 +133,19 @@ def load_environment_data(data_dir: str) -> pd.DataFrame:
 
     env = pd.concat(frames, ignore_index=True)
 
-    # 표준 컬럼 정리
-    # time 파싱(실패 시 NaT)
+    # (이하 데이터 전처리 로직은 기존과 동일)
     if "time" in env.columns:
         env["time"] = pd.to_datetime(env["time"], errors="coerce")
     else:
         env["time"] = pd.NaT
 
-    # 숫자형 변환
     for c in ["temperature", "humidity", "ph", "ec"]:
         if c in env.columns:
             env[c] = pd.to_numeric(env[c], errors="coerce")
         else:
             env[c] = pd.NA
 
-    # 정렬
-    env = env.sort_values(["school", "time"], kind="stable")
-    return env
+    return env.sort_values(["school", "time"], kind="stable")
 
 
 @st.cache_data(show_spinner=False)
@@ -179,49 +157,55 @@ def load_growth_data(data_dir: str) -> pd.DataFrame:
     + school, ec_target
     """
     data_path = Path(data_dir)
-    _, xlsx_path = _find_data_files(data_path)
+    _, growth_files = _find_data_files(data_path)
 
-    if xlsx_path is None or not xlsx_path.exists():
-        return pd.DataFrame()
-
-    try:
-        xl = pd.ExcelFile(xlsx_path, engine="openpyxl")
-    except Exception:
-        return pd.DataFrame()
-
-    sheets = xl.sheet_names  # ✅ 하드코딩 금지
-    if not sheets:
+    if not growth_files:
         return pd.DataFrame()
 
     frames: List[pd.DataFrame] = []
-    for sh in sheets:
+
+    for fp in growth_files:
         try:
-            df = pd.read_excel(xl, sheet_name=sh)
+            # 엑셀 파일인 경우 (기존 로직)
+            if fp.suffix.lower() == ".xlsx":
+                xl = pd.ExcelFile(fp, engine="openpyxl")
+                for sh in xl.sheet_names:
+                    df = pd.read_excel(xl, sheet_name=sh)
+                    # 시트명에서 학교 찾기
+                    matched_school = None
+                    for sc in SCHOOLS:
+                        if _contains_token(str(sh), sc):
+                            matched_school = sc
+                            break
+
+                    if matched_school:
+                        df["school"] = matched_school
+                        df["ec_target"] = EC_TARGET_BY_SCHOOL.get(matched_school, pd.NA)
+                        frames.append(df)
+
+            # CSV 파일인 경우 (새로 추가된 로직)
+            elif fp.suffix.lower() == ".csv":
+                # 파일명에서 학교 찾기 (예: "4개교_생육결과데이터... - 동산고.csv")
+                matched_school = None
+                for sc in SCHOOLS:
+                    if _contains_token(fp.name, sc):
+                        matched_school = sc
+                        break
+
+                if matched_school:
+                    df = pd.read_csv(fp)
+                    df["school"] = matched_school
+                    df["ec_target"] = EC_TARGET_BY_SCHOOL.get(matched_school, pd.NA)
+                    frames.append(df)
+
         except Exception:
             continue
-
-        # 시트명이 학교명일 가능성이 높으므로 NFC/NFD로 매칭
-        matched_school: Optional[str] = None
-        for sc in SCHOOLS:
-            if _contains_school_token(str(sh), sc):
-                matched_school = sc
-                break
-
-        # 매칭이 안 되면 시트명을 그대로 학교로 두되(에러 방지), EC는 결측 처리
-        school_val = matched_school if matched_school is not None else str(sh)
-
-        df = df.copy()
-        df["school"] = school_val
-        df["ec_target"] = EC_TARGET_BY_SCHOOL.get(matched_school, pd.NA)
-
-        frames.append(df)
 
     if not frames:
         return pd.DataFrame()
 
     growth = pd.concat(frames, ignore_index=True)
 
-    # 숫자형 변환(가능한 컬럼만)
     num_cols = ["잎 수(장)", "지상부 길이(mm)", "지하부길이(mm)", "생중량(g)"]
     for c in num_cols:
         if c in growth.columns:
